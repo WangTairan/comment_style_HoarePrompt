@@ -1,0 +1,399 @@
+import os
+from tenacity import retry, stop_after_attempt, wait_random_exponential
+from groq import Groq
+import ast
+import re
+import astor
+from dataclasses import dataclass
+from enum import Enum, auto
+import ast
+import astor
+
+
+class State(Enum):
+    TOP = auto()
+    BOTTOM = auto()
+    UNKNOWN = auto()
+
+
+def print_state(s):
+    if s == State.UNKNOWN:
+        return "the state is unknown"
+    if s == State.TOP:
+        return "variables can hold any values"
+    if s == State.BOTTOM:
+        return "the state is unreachable"
+    return s
+
+
+@dataclass
+class Triple:
+    precondition: str
+    command: ast.AST
+    postcondition: str
+
+    def __str__(self):
+        return f"{{ {print_state(self.precondition)} }}\n{pprint_cmd(self.command)}{{ {print_state(self.postcondition)} }}"
+
+    def with_postcondition(self, pc):
+        return Triple(self.precondition, self.command, pc)
+
+
+def parse_stmt(source):
+    return ast.parse(source).body[0]
+
+
+def pprint_cmd(cmd):
+    if isinstance(cmd, list):
+        return "\n".join([astor.to_source(c) for c in cmd])
+    else:
+        return astor.to_source(cmd)
+
+
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+
+DEFAULT_TEMPERATURE = 0.7
+MODEL = "mixtral-8x7b-32768"
+VERIFYER_SYSTEM_PROMPT = """You are assigned the role of a program verifier, responsible for completing Hoare triples. Each Hoare triple is made up of three components: a precondition, a program fragment, and a postcondition. The precondition and the postcondition are expressed in natural language.
+
+Precondition: describes the initial state of the program variables before the execution of the program fragment. This description should only include the values of the variables, without detailing the operational aspects of the program.
+
+Program Fragment: This is a given part of the task and is not something you need to create or modify.
+
+Postcondition: describes the state of the program variables after the execution of the program fragment with the initial state described in the precondition. This description should include both the values of the variables and the relationships between them. Similar to the precondition, avoid explaining how the program operates; concentrate solely on the variable values and their interrelations."""
+
+generic_ctx = [
+    Triple(
+        "n can be any value",
+        parse_stmt("n = int(input())"),
+        "n is an input integer",
+    ),
+    Triple(
+        "n is either 3 or 5",
+        parse_stmt("m = n + 1"),
+        "n is either 3 or 5; m is either 4 or 6",
+    ),
+    Triple("x is greater than zero", parse_stmt("x = x + 1"), "x greater than one"),
+    Triple("n is a bool value", parse_stmt("num = 5"), "n is a bool value, num is 5"),
+    Triple(
+        "i is integer", parse_stmt("i += 1"), "i is integer and i is increased by 1"
+    ),
+    Triple(
+        State.TOP,
+        parse_stmt("raise ValueError('An error occurred')"),
+        "ValueError is raised",
+    ),
+    Triple(
+        State.TOP,
+        parse_stmt("return True"),
+        "the function return True",
+    ),
+    Triple(
+        "n is an integer, m is 2",
+        parse_stmt(
+            '''if n < m:
+    return True
+    """the function return True"""'''
+        ),
+        "n is an integer, m is 2. If n is less then 2, then the function return True",
+    ),
+]
+
+
+@retry(wait=wait_random_exponential(min=1, max=240), stop=stop_after_attempt(15))
+def chat_with_groq(**kwargs):
+    return client.chat.completions.create(**kwargs)
+
+
+def complete_triple(incomplete_triple, context_triples=generic_ctx):
+    msgs = []
+    msgs.append({"role": "system", "content": VERIFYER_SYSTEM_PROMPT})
+    for ctx in context_triples:
+        msgs.append(
+            {"role": "system", "name": "example_user", "content": format_prompt(ctx)}
+        )
+        msgs.append(
+            {"role": "assistant", "content": f"Postcondition: **{ctx.postcondition}**"}
+        )
+    msgs.append({"role": "user", "content": format_prompt(incomplete_triple)})
+    response = chat_with_groq(
+        model=MODEL, messages=msgs, temperature=DEFAULT_TEMPERATURE
+    )
+    post = extract_postcondition(response.choices[0].message.content)
+    return post
+
+
+def format_prompt(triple: Triple) -> str:
+    precondition_comment = f'"""{print_state(triple.precondition)}"""\r\n'
+    program_with_precondition = precondition_comment + pprint_cmd(triple.command)
+    return program_with_precondition
+
+
+def extract_postcondition(s: str) -> str:
+    pattern = r"Postcondition:\s*\*\*(.*?)\*\*"
+    match = re.search(pattern, s, re.DOTALL)
+    if match:
+        return match.group(1)
+    return s
+
+
+class Annotator(ast.NodeTransformer):
+    def __init__(self):
+        self.comments = []
+        self.last = None
+
+    def add_comment(self, comment, lineno):
+        self.comments.append((comment, lineno))
+        self.last = (comment, lineno)
+
+    def get_last_comment(self):
+        return self.last
+
+    def insert_comments(self, node):
+        if hasattr(node, "body") and isinstance(node.body, list):
+            new_body = []
+            for child in node.body:
+                new_body.append(self.visit(child))
+                for comment, lineno in self.comments[:]:
+                    if hasattr(child, "lineno") and child.lineno == lineno:
+                        new_comment = ast.Expr(value=ast.Constant(value=f"{comment}"))
+                        new_comment.lineno = lineno
+                        new_body.append(new_comment)
+                        self.comments.remove((comment, lineno))
+            node.body = new_body
+        return node
+
+    def visit(self, node):
+        return self.insert_comments(super().generic_visit(node))
+
+
+class Deletor(ast.NodeTransformer):
+    def __init__(self):
+        self.comments_to_keep = []
+
+    def append_comment_to_keep(self, comment):
+        self.comments_to_keep.append(comment)
+
+    def remove_comment_to_keep(self, comment):
+        self.comments_to_keep.remove(comment)
+
+    def add_clean_temporary_comment(self, comment, node):
+        self.append_comment_to_keep(comment)
+        node = self.visit(node)
+        self.remove_comment_to_keep(comment)
+        return node
+
+    def visit(self, node):
+        if hasattr(node, "body") and isinstance(node.body, list):
+            new_body = []
+            for child in node.body:
+                if not (
+                    isinstance(child, ast.Expr)
+                    and isinstance(child.value, ast.Constant)
+                    and (child.value.value, child.lineno) not in self.comments_to_keep
+                ):
+                    new_body.append(child)
+            node.body = new_body
+        return super().generic_visit(node)
+
+
+def print_code(node, message="Current code"):
+    code = astor.to_source(node)
+    print(f"{message}:\n{code}")
+
+
+def complete_triple_cot(
+    triple: Triple, annotator: Annotator, deletor: Deletor, node
+) -> tuple:
+    assert triple.postcondition == State.UNKNOWN
+    if isinstance(
+        triple.command,
+        (
+            ast.Assign,
+            ast.AugAssign,
+            ast.Expr,
+            ast.Return,
+            ast.Raise,
+            ast.Pass,
+            ast.Break,
+            ast.Continue,
+        ),
+    ):
+        post = complete_triple(triple)
+        lineno = triple.command.lineno
+        annotator.add_comment(post, lineno)
+        triple.command = annotator.visit(node)
+        print_code(node, "After a simple command")
+        return post, lineno
+
+    elif isinstance(triple.command, list):
+        pre = triple.precondition
+        temp = []
+        for subcmd in triple.command:
+            completion, lineno = complete_triple_cot(
+                Triple(pre, subcmd, State.UNKNOWN), annotator, deletor, node
+            )
+            deletor.append_comment_to_keep((completion, lineno))
+            temp.append((completion, lineno))
+            pre = completion
+
+        overall_post = complete_triple(triple)
+        last_lineno = triple.command[-1].lineno if triple.command else 0
+        for item in temp:
+            deletor.remove_comment_to_keep(item)
+        return overall_post, last_lineno
+
+    elif isinstance(triple.command, ast.If):
+        pre = triple.precondition
+        then_completion, then_lineno = complete_triple_cot(
+            Triple(pre, triple.command.body, State.UNKNOWN), annotator, deletor, node
+        )
+        deletor.append_comment_to_keep((then_completion, then_lineno))
+        temp = [(then_completion, then_lineno)]
+
+        if triple.command.orelse:
+            else_completion, else_lineno = complete_triple_cot(
+                Triple(pre, triple.command.orelse, State.UNKNOWN),
+                annotator,
+                deletor,
+                node,
+            )
+            deletor.append_comment_to_keep((else_completion, else_lineno))
+            temp.append((else_completion, else_lineno))
+            last_lineno = max(then_lineno, else_lineno)
+        else:
+            last_lineno = then_lineno
+
+        overall_post = complete_triple(triple)
+        for item in temp:
+            deletor.remove_comment_to_keep(item)
+        annotator.add_comment(overall_post, last_lineno)
+        triple.command = annotator.visit(node)
+        comment_to_add = annotator.get_last_comment()
+        triple.command = deletor.add_clean_temporary_comment(comment_to_add, node)
+        print_code(node, "After if statement")
+        return overall_post, last_lineno
+
+    elif isinstance(triple.command, ast.Try):
+        pre = triple.precondition
+
+        try_completion, try_lineno = complete_triple_cot(
+            Triple(pre, triple.command.body, State.UNKNOWN), annotator, deletor, node
+        )
+
+        except_completion, except_lineno = complete_triple_cot(
+            Triple(State.UNKNOWN, triple.command.body, State.UNKNOWN),
+            annotator,
+            deletor,
+            node,
+        )
+
+        if triple.command.orelse:
+            else_completion, else_lineno = complete_triple_cot(
+                Triple(try_completion, triple.command.orelse, State.UNKNOWN),
+                annotator,
+                deletor,
+                node,
+            )
+        else:
+            else_lineno = try_lineno
+
+        if triple.command.finalbody:
+            finally_completion, finally_lineno = complete_triple_cot(
+                Triple(State.UNKNOWN, triple.command.finalbody, State.UNKNOWN),
+                annotator,
+                deletor,
+                node,
+            )
+            last_lineno = max(try_lineno, except_lineno, else_lineno, finally_lineno)
+        else:
+            last_lineno = max(try_lineno, except_lineno, else_lineno)
+
+        overall_post = complete_triple(triple)
+        for item in temp:
+            deletor.remove_comment_to_keep(item)
+        annotator.add_comment(overall_post, last_lineno)
+        triple.command = annotator.visit(node)
+        comment_to_add = annotator.get_last_comment()
+        triple.command = deletor.add_clean_temporary_comment(comment_to_add, node)
+        print_code(node, "After cleaning temporary comments")
+        return overall_post, last_lineno
+
+    elif isinstance(triple.command, ast.For):
+        pre = triple.precondition
+        body_completion, body_lineno = complete_triple_cot(
+            Triple(pre, triple.command.body, State.UNKNOWN), annotator, deletor, node
+        )
+        overall_post = complete_triple(triple)
+
+        last_lineno = triple.command.body[-1].lineno if triple.command.body else 0
+        annotator.add_comment(overall_post, last_lineno)
+        triple.command = annotator.visit(node)
+        comment_to_add = annotator.get_last_comment()
+        triple.command = deletor.add_clean_temporary_comment(comment_to_add, node)
+        print_code(node, "After for loop")
+        return overall_post, last_lineno
+
+    elif isinstance(triple.command, ast.While):
+        pre = triple.precondition
+        body_completion, body_lineno = complete_triple_cot(
+            Triple(pre, triple.command.body, State.UNKNOWN), annotator, deletor, node
+        )
+        overall_post = complete_triple(triple)
+
+        last_lineno = triple.command.body[-1].lineno if triple.command.body else 0
+        annotator.add_comment(overall_post, last_lineno)
+        triple.command = annotator.visit(node)
+        comment_to_add = annotator.get_last_comment()
+        triple.command = deletor.add_clean_temporary_comment(comment_to_add, node)
+        print_code(node, "After while loop")
+        return overall_post, last_lineno
+
+    elif isinstance(triple.command, ast.FunctionDef):
+        pre = triple.precondition
+        body_completion, body_lineno = complete_triple_cot(
+            Triple(pre, triple.command.body, State.UNKNOWN), annotator, deletor, node
+        )
+        overall_post = complete_triple(triple)
+
+        last_lineno = triple.command.body[-1].lineno if triple.command.body else 0
+        annotator.add_comment(overall_post, last_lineno)
+        triple.command = annotator.visit(node)
+        triple.command = deletor.add_clean_temporary_comment(annotator, node)
+        print_code(node, "After function def")
+        return overall_post, last_lineno
+
+    elif isinstance(triple.command, (ast.Import, ast.ImportFrom, ast.Assert)):
+        return triple.precondition, 0
+
+    raise ValueError(
+        f"unsupported statement type: {triple.command} {pprint_cmd(triple.command)}"
+    )
+
+
+def main(code, precondition: str):
+    parsed_code = ast.parse(code)
+    triple = Triple(precondition, parsed_code.body, State.UNKNOWN)
+    annotator = Annotator()
+    deletor = Deletor()
+
+    complete_triple_cot(triple, annotator, deletor, parsed_code)
+    annotated_tree = annotator.visit(parsed_code)
+    print_code(annotated_tree, "Final annotated code")
+
+
+precondition = "n is an integer."
+
+code = """
+def is_not_prime(n):
+    m = 2
+    if n < m:
+        return True
+    for i in range(2, n):
+        if n % i == 0:
+            return True
+    return False
+"""
+
+main(code, precondition)
