@@ -63,6 +63,7 @@ Program Fragment: This is a given part of the task and is not something you need
 
 Postcondition: describes the state of the program variables after the execution of the program fragment with the initial state described in the precondition. This description should include both the values of the variables and the relationships between them. Similar to the precondition, avoid explaining how the program operates; concentrate solely on the variable values and their interrelations."""
 
+
 generic_ctx = [
     Triple(
         "n can be any value",
@@ -141,14 +142,10 @@ def extract_postcondition(s: str) -> str:
 class Annotator(ast.NodeTransformer):
     def __init__(self):
         self.comments = []
-        self.last = None
 
     def add_comment(self, comment, lineno):
         self.comments.append((comment, lineno))
         self.last = (comment, lineno)
-
-    def get_last_comment(self):
-        return self.last
 
     def insert_comments(self, node):
         if hasattr(node, "body") and isinstance(node.body, list):
@@ -177,12 +174,6 @@ class Deletor(ast.NodeTransformer):
 
     def remove_comment_to_keep(self, comment):
         self.comments_to_keep.remove(comment)
-
-    def add_clean_temporary_comment(self, comment, node):
-        self.append_comment_to_keep(comment)
-        node = self.visit(node)
-        self.remove_comment_to_keep(comment)
-        return node
 
     def visit(self, node):
         if hasattr(node, "body") and isinstance(node.body, list):
@@ -222,9 +213,6 @@ def complete_triple_cot(
     ):
         post = complete_triple(triple)
         lineno = triple.command.lineno
-        annotator.add_comment(post, lineno)
-        triple.command = annotator.visit(node)
-        print_code(node, "After a simple command")
         return post, lineno
 
     elif isinstance(triple.command, list):
@@ -234,14 +222,18 @@ def complete_triple_cot(
             completion, lineno = complete_triple_cot(
                 Triple(pre, subcmd, State.UNKNOWN), annotator, deletor, node
             )
+            annotator.add_comment(completion, lineno)
+            annotator.visit(node)
             deletor.append_comment_to_keep((completion, lineno))
             temp.append((completion, lineno))
             pre = completion
+            print_code(node, "After a element in list")
 
         overall_post = complete_triple(triple)
         last_lineno = triple.command[-1].lineno if triple.command else 0
         for item in temp:
             deletor.remove_comment_to_keep(item)
+        deletor.visit(node)
         return overall_post, last_lineno
 
     elif isinstance(triple.command, ast.If):
@@ -249,8 +241,7 @@ def complete_triple_cot(
         then_completion, then_lineno = complete_triple_cot(
             Triple(pre, triple.command.body, State.UNKNOWN), annotator, deletor, node
         )
-        deletor.append_comment_to_keep((then_completion, then_lineno))
-        temp = [(then_completion, then_lineno)]
+        ctx = [Triple(pre, triple.command.body, then_completion)]
 
         if triple.command.orelse:
             else_completion, else_lineno = complete_triple_cot(
@@ -259,20 +250,12 @@ def complete_triple_cot(
                 deletor,
                 node,
             )
-            deletor.append_comment_to_keep((else_completion, else_lineno))
-            temp.append((else_completion, else_lineno))
+            ctx.append(Triple(pre, triple.command.orelse, else_completion))
             last_lineno = max(then_lineno, else_lineno)
         else:
             last_lineno = then_lineno
 
-        overall_post = complete_triple(triple)
-        for item in temp:
-            deletor.remove_comment_to_keep(item)
-        annotator.add_comment(overall_post, last_lineno)
-        triple.command = annotator.visit(node)
-        comment_to_add = annotator.get_last_comment()
-        triple.command = deletor.add_clean_temporary_comment(comment_to_add, node)
-        print_code(node, "After if statement")
+        overall_post = complete_triple(triple, ctx)
         return overall_post, last_lineno
 
     elif isinstance(triple.command, ast.Try):
@@ -288,7 +271,7 @@ def complete_triple_cot(
             deletor,
             node,
         )
-
+        ctx = [Triple(pre, triple.command.body, try_completion), Triple(State.UNKNOWN, triple.command.body, except_completion)]
         if triple.command.orelse:
             else_completion, else_lineno = complete_triple_cot(
                 Triple(try_completion, triple.command.orelse, State.UNKNOWN),
@@ -296,6 +279,7 @@ def complete_triple_cot(
                 deletor,
                 node,
             )
+            ctx.append(Triple(pre, triple.command.orelse, else_completion))
         else:
             else_lineno = try_lineno
 
@@ -306,18 +290,12 @@ def complete_triple_cot(
                 deletor,
                 node,
             )
+            ctx.append(Triple(State.UNKNOWN, triple.command.orelse, finally_completion))
             last_lineno = max(try_lineno, except_lineno, else_lineno, finally_lineno)
         else:
             last_lineno = max(try_lineno, except_lineno, else_lineno)
 
-        overall_post = complete_triple(triple)
-        for item in temp:
-            deletor.remove_comment_to_keep(item)
-        annotator.add_comment(overall_post, last_lineno)
-        triple.command = annotator.visit(node)
-        comment_to_add = annotator.get_last_comment()
-        triple.command = deletor.add_clean_temporary_comment(comment_to_add, node)
-        print_code(node, "After cleaning temporary comments")
+        overall_post = complete_triple(triple, ctx)
         return overall_post, last_lineno
 
     elif isinstance(triple.command, ast.For):
@@ -325,14 +303,10 @@ def complete_triple_cot(
         body_completion, body_lineno = complete_triple_cot(
             Triple(pre, triple.command.body, State.UNKNOWN), annotator, deletor, node
         )
-        overall_post = complete_triple(triple)
+        ctx = [Triple(pre, triple.command.body, body_completion)]
+        overall_post = complete_triple(triple, ctx)
 
         last_lineno = triple.command.body[-1].lineno if triple.command.body else 0
-        annotator.add_comment(overall_post, last_lineno)
-        triple.command = annotator.visit(node)
-        comment_to_add = annotator.get_last_comment()
-        triple.command = deletor.add_clean_temporary_comment(comment_to_add, node)
-        print_code(node, "After for loop")
         return overall_post, last_lineno
 
     elif isinstance(triple.command, ast.While):
@@ -340,14 +314,10 @@ def complete_triple_cot(
         body_completion, body_lineno = complete_triple_cot(
             Triple(pre, triple.command.body, State.UNKNOWN), annotator, deletor, node
         )
-        overall_post = complete_triple(triple)
+        ctx = [Triple(pre, triple.command.body, body_completion)]
+        overall_post = complete_triple(triple, ctx)
 
         last_lineno = triple.command.body[-1].lineno if triple.command.body else 0
-        annotator.add_comment(overall_post, last_lineno)
-        triple.command = annotator.visit(node)
-        comment_to_add = annotator.get_last_comment()
-        triple.command = deletor.add_clean_temporary_comment(comment_to_add, node)
-        print_code(node, "After while loop")
         return overall_post, last_lineno
 
     elif isinstance(triple.command, ast.FunctionDef):
@@ -355,13 +325,9 @@ def complete_triple_cot(
         body_completion, body_lineno = complete_triple_cot(
             Triple(pre, triple.command.body, State.UNKNOWN), annotator, deletor, node
         )
-        overall_post = complete_triple(triple)
-
+        ctx = [Triple(pre, triple.command.body, body_completion)]
+        overall_post = complete_triple(triple, ctx)
         last_lineno = triple.command.body[-1].lineno if triple.command.body else 0
-        annotator.add_comment(overall_post, last_lineno)
-        triple.command = annotator.visit(node)
-        triple.command = deletor.add_clean_temporary_comment(annotator, node)
-        print_code(node, "After function def")
         return overall_post, last_lineno
 
     elif isinstance(triple.command, (ast.Import, ast.ImportFrom, ast.Assert)):
@@ -378,9 +344,11 @@ def main(code, precondition: str):
     annotator = Annotator()
     deletor = Deletor()
 
-    complete_triple_cot(triple, annotator, deletor, parsed_code)
-    annotated_tree = annotator.visit(parsed_code)
-    print_code(annotated_tree, "Final annotated code")
+    response, line = complete_triple_cot(triple, annotator, deletor, parsed_code)
+    print("final postcondition:")
+    print(response)
+
+    
 
 
 precondition = "n is an integer."
