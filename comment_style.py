@@ -147,18 +147,34 @@ class Annotator(ast.NodeTransformer):
         self.comments.append((comment, lineno))
         self.last = (comment, lineno)
 
-    def insert_comments(self, node):
-        if hasattr(node, "body") and isinstance(node.body, list):
-            new_body = []
-            for child in node.body:
-                new_body.append(self.visit(child))
+    def _insert_comments_into_block(self, block):
+        if isinstance(block, list):
+            new_block = []
+            for child in block:
+                new_block.append(self.visit(child))
                 for comment, lineno in self.comments[:]:
                     if hasattr(child, "lineno") and child.lineno == lineno:
                         new_comment = ast.Expr(value=ast.Constant(value=f"{comment}"))
                         new_comment.lineno = lineno
-                        new_body.append(new_comment)
+                        new_block.append(new_comment)
                         self.comments.remove((comment, lineno))
-            node.body = new_body
+            return new_block
+        return block
+
+    def insert_comments(self, node):
+        if hasattr(node, "body"):
+            node.body = self._insert_comments_into_block(node.body)
+        
+        if hasattr(node, "orelse"):
+            node.orelse = self._insert_comments_into_block(node.orelse)
+
+        if hasattr(node, "finalbody"):
+            node.finalbody = self._insert_comments_into_block(node.finalbody)
+        
+        if hasattr(node, "handlers"):
+            for handler in node.handlers:
+                handler.body = self._insert_comments_into_block(handler.body)
+
         return node
 
     def visit(self, node):
@@ -175,18 +191,37 @@ class Deletor(ast.NodeTransformer):
     def remove_comment_to_keep(self, comment):
         self.comments_to_keep.remove(comment)
 
-    def visit(self, node):
-        if hasattr(node, "body") and isinstance(node.body, list):
-            new_body = []
-            for child in node.body:
+    def _remove_comments_from_block(self, block):
+        if isinstance(block, list):
+            new_block = []
+            for child in block:
                 if not (
                     isinstance(child, ast.Expr)
                     and isinstance(child.value, ast.Constant)
                     and (child.value.value, child.lineno) not in self.comments_to_keep
                 ):
-                    new_body.append(child)
-            node.body = new_body
-        return super().generic_visit(node)
+                    new_block.append(self.visit(child))
+            return new_block
+        return block
+
+    def remove_comments(self, node):
+        if hasattr(node, "body"):
+            node.body = self._remove_comments_from_block(node.body)
+        
+        if hasattr(node, "orelse"):
+            node.orelse = self._remove_comments_from_block(node.orelse)
+
+        if hasattr(node, "finalbody"):
+            node.finalbody = self._remove_comments_from_block(node.finalbody)
+        
+        if hasattr(node, "handlers"):
+            for handler in node.handlers:
+                handler.body = self._remove_comments_from_block(handler.body)
+
+        return node
+
+    def visit(self, node):
+        return self.remove_comments(super().generic_visit(node))
 
 
 def print_code(node, message="Current code"):
@@ -226,8 +261,8 @@ def complete_triple_cot(
             annotator.visit(node)
             deletor.append_comment_to_keep((completion, lineno))
             temp.append((completion, lineno))
-            pre = completion
             print_code(node, "After a element in list")
+            pre = completion
 
         overall_post = complete_triple(triple)
         last_lineno = triple.command[-1].lineno if triple.command else 0
@@ -266,7 +301,7 @@ def complete_triple_cot(
         )
 
         except_completion, except_lineno = complete_triple_cot(
-            Triple(State.UNKNOWN, triple.command.body, State.UNKNOWN),
+            Triple(State.UNKNOWN, triple.command.handlers, State.UNKNOWN),
             annotator,
             deletor,
             node,
@@ -363,5 +398,31 @@ def is_not_prime(n):
             return True
     return False
 """
+# precondition = "arr is a sorted list of integers and x is an integer."
+# code = '''
+# def last(arr, x):
+#     if not arr:
+#         return -1
+#     elif len(arr) == 1:
+#         if arr[0] == x:
+#             return 0
+#         else:
+#             return -1
+#     else:
+#         low = 0
+#         high = len(arr) - 1
+#         while low <= high:
+#             mid = (low + high) // 2
+#             if arr[mid] == x:
+#                 if mid == len(arr) - 1 or arr[mid] != arr[mid+1]:
+#                     return mid
+#                 else:
+#                     low = mid + 1
+#             elif arr[mid] < x:
+#                 low = mid + 1
+#             else:
+#                 high = mid - 1
+#         return -1
+# '''
 
 main(code, precondition)
